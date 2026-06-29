@@ -1,0 +1,14 @@
+{
+  "pins" : [
+    {
+      "identity" : "smartcodable",
+      "kind" : "remoteSourceControl",
+      "location" : "https://github.com/iAmMccc/SmartCodable.git",
+      "state" : {
+        "revision" : "90589e961507631d51a0f5784630c95c91387fe4",
+        "version" : "7.0.0"
+      }
+    }
+  ],
+  "version" : 2
+}
