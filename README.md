@@ -337,6 +337,33 @@ struct WeakNetAPI: NetworkRequest {
 
 ---
 
+## 七点五、文件下载与后台任务
+
+### 文件下载
+
+`NetworkClient.shared.download` 提供 async/await 文件下载，内置最多 3 个并发限制，自动建目录、覆盖同名文件：
+
+```swift
+let localURL = try await NetworkClient.shared.download(
+    from: "https://cdn.example.com/a.png",
+    to: saveURL,
+    runsInBackgroundTask: true   // 可选：切后台也争取时间下完
+)
+```
+
+### 后台任务保护
+
+App 切到后台时，关键请求（上传、识别等）希望仍有一段时间跑完。在请求里把 `runsInBackgroundTask` 设为 `true`，框架会用 `UIApplication.beginBackgroundTask` 包一层后台保护（非 UIKit 平台自动空操作）：
+
+```swift
+struct UploadAPI: NetworkRequest {
+    typealias ResponseModel = UploadResult
+    var path = "/upload"
+    var method: HTTPMethod = .post
+    var runsInBackgroundTask: Bool { true }   // 切后台也争取时间完成
+}
+```
+
 ## 八、错误处理
 
 所有错误都归一化成 `NetworkError`：
@@ -388,6 +415,7 @@ do {
 | `envelope` | 外层字段映射与成功判定 | 全局 `defaultEnvelope` |
 | `cachePolicy` | URL 缓存策略 | `.useProtocolCachePolicy` |
 | `ignoreGlobalInterceptors` | 是否忽略全局拦截器 | `false` |
+| `runsInBackgroundTask` | 是否在后台任务保护下执行 | `false` |
 | `send()` | 发送请求（async） | 内置实现，一般无需重写 |
 
 ---

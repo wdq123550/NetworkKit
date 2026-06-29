@@ -15,12 +15,24 @@ public final class NetworkClient {
     private init() {}
     /// 请求体/查询参数编码器
     private let encoder = JSONEncoder()
+    /// 文件下载并发限制器（默认最多 3 个并发）
+    private let downloadLimiter = DownloadLimiter(maxConcurrent: 3)
 }
 
 // MARK: - 方法
 extension NetworkClient {
     /// 发送请求并解析为返回模型
     public func send<R: NetworkRequest>(_ request: R) async throws -> R.ResponseModel {
+        guard request.runsInBackgroundTask else {
+            return try await sendCore(request)
+        }
+        return try await BackgroundTaskRunner.run(name: "NetworkKit.send.\(request.path)") {
+            try await sendCore(request)
+        }
+    }
+
+    /// 发送请求的核心流程
+    private func sendCore<R: NetworkRequest>(_ request: R) async throws -> R.ResponseModel {
         let urlRequest = try await buildURLRequest(for: request)
         let (data, response) = try await performWithRetry(urlRequest, request: request)
         try await runResponseInterceptors(data: data, response: response, urlRequest: urlRequest, request: request)
@@ -180,6 +192,70 @@ extension NetworkClient {
     }
 }
 
+// MARK: - 文件下载
+extension NetworkClient {
+    /// 下载文件到指定本地路径
+    /// - Parameters:
+    ///   - urlString: 文件完整地址
+    ///   - destination: 保存到的本地文件 URL（已存在会被覆盖）
+    ///   - headers: 额外请求头（不叠加全局默认头，下载通常无需）
+    ///   - timeout: 超时（秒）；nil 则用会话默认
+    ///   - runsInBackgroundTask: 是否在后台任务保护下执行；默认 false
+    /// - Returns: 下载完成后的本地文件 URL
+    @discardableResult
+    public func download(
+        from urlString: String,
+        to destination: URL,
+        headers: [String: String] = [:],
+        timeout: TimeInterval? = nil,
+        runsInBackgroundTask: Bool = false
+    ) async throws -> URL {
+        guard runsInBackgroundTask else {
+            return try await performDownload(from: urlString, to: destination, headers: headers, timeout: timeout)
+        }
+        return try await BackgroundTaskRunner.run(name: "NetworkKit.download") {
+            try await performDownload(from: urlString, to: destination, headers: headers, timeout: timeout)
+        }
+    }
+
+    /// 实际下载逻辑（受并发限制器约束，最多 3 个并发）
+    private func performDownload(
+        from urlString: String,
+        to destination: URL,
+        headers: [String: String],
+        timeout: TimeInterval?
+    ) async throws -> URL {
+        guard let url = URL(string: urlString) else { throw NetworkError.invalidURL }
+
+        await downloadLimiter.acquire()
+        defer { Task { await downloadLimiter.release() } }
+
+        var urlRequest = URLRequest(url: url)
+        if let timeout { urlRequest.timeoutInterval = timeout }
+        for (key, value) in headers { urlRequest.setValue(value, forHTTPHeaderField: key) }
+
+        do {
+            let (tempURL, response) = try await NetworkConfiguration.shared.session.download(for: urlRequest)
+            if let http = response as? HTTPURLResponse, !(200..<300).contains(http.statusCode) {
+                throw NetworkError.httpStatus(code: http.statusCode, data: Data())
+            }
+            // 确保目录存在；已有同名文件先删除再移动
+            let directory = destination.deletingLastPathComponent()
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+            if FileManager.default.fileExists(atPath: destination.path) {
+                try FileManager.default.removeItem(at: destination)
+            }
+            try FileManager.default.moveItem(at: tempURL, to: destination)
+            log("⬇️ 下载完成 \(url.absoluteString)")
+            return destination
+        } catch let error as NetworkError {
+            throw error
+        } catch {
+            throw mapTransportError(error)
+        }
+    }
+}
+
 // MARK: - 编码辅助方法
 extension NetworkClient {
     /// 把 Encodable 结构体编码成 JSON 请求体
@@ -255,5 +331,39 @@ extension NetworkClient {
         guard NetworkConfiguration.shared.enableLog else { return }
         print("[debugLog] NetworkClient \(message)")
         #endif
+    }
+}
+
+// MARK: - DownloadLimiter
+/// 下载并发限制器：用 actor + 续体实现的简单信号量，限制同时进行的下载数量
+actor DownloadLimiter {
+    /// 最大并发数
+    private let maxConcurrent: Int
+    /// 当前占用数
+    private var current = 0
+    /// 等待队列
+    private var waiters: [CheckedContinuation<Void, Never>] = []
+
+    init(maxConcurrent: Int) {
+        self.maxConcurrent = maxConcurrent
+    }
+
+    /// 申请一个下载名额（满则挂起等待）
+    func acquire() async {
+        if current < maxConcurrent {
+            current += 1
+            return
+        }
+        await withCheckedContinuation { waiters.append($0) }
+    }
+
+    /// 释放一个下载名额（有等待者则直接放行）
+    func release() {
+        if waiters.isEmpty {
+            current = max(0, current - 1)
+        } else {
+            let next = waiters.removeFirst()
+            next.resume()
+        }
     }
 }
