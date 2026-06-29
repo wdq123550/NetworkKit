@@ -44,7 +44,7 @@ public protocol NetworkRequest {
     var cachePolicy: URLRequest.CachePolicy { get }
     /// 是否忽略全局拦截器（特殊接口如登录/刷新 token 可置 true）；默认 false
     var ignoreGlobalInterceptors: Bool { get }
-    /// 是否在后台任务保护下执行（App 切后台仍争取时间完成，适合上传/识别等关键请求）；默认 false
+    /// 是否在后台任务保护下执行（App 切后台仍争取时间完成）；默认 true（用户何时切后台不可控，默认开启更稳）
     var runsInBackgroundTask: Bool { get }
 
     /// 发送请求并解析为返回模型（全程 async/await）
@@ -65,7 +65,7 @@ extension NetworkRequest {
     public var envelope: ResponseEnvelope { NetworkConfiguration.shared.defaultEnvelope }
     public var cachePolicy: URLRequest.CachePolicy { .useProtocolCachePolicy }
     public var ignoreGlobalInterceptors: Bool { false }
-    public var runsInBackgroundTask: Bool { false }
+    public var runsInBackgroundTask: Bool { true }
 
     /// 默认发送实现：转交执行引擎
     public func send() async throws -> ResponseModel {

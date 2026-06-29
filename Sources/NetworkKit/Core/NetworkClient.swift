@@ -200,7 +200,7 @@ extension NetworkClient {
     ///   - destination: 保存到的本地文件 URL（已存在会被覆盖）
     ///   - headers: 额外请求头（不叠加全局默认头，下载通常无需）
     ///   - timeout: 超时（秒）；nil 则用会话默认
-    ///   - runsInBackgroundTask: 是否在后台任务保护下执行；默认 false
+    ///   - runsInBackgroundTask: 是否在后台任务保护下执行；默认 true
     /// - Returns: 下载完成后的本地文件 URL
     @discardableResult
     public func download(
@@ -208,7 +208,7 @@ extension NetworkClient {
         to destination: URL,
         headers: [String: String] = [:],
         timeout: TimeInterval? = nil,
-        runsInBackgroundTask: Bool = false
+        runsInBackgroundTask: Bool = true
     ) async throws -> URL {
         guard runsInBackgroundTask else {
             return try await performDownload(from: urlString, to: destination, headers: headers, timeout: timeout)

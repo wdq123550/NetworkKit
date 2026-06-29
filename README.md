@@ -346,21 +346,19 @@ struct WeakNetAPI: NetworkRequest {
 ```swift
 let localURL = try await NetworkClient.shared.download(
     from: "https://cdn.example.com/a.png",
-    to: saveURL,
-    runsInBackgroundTask: true   // 可选：切后台也争取时间下完
-)
+    to: saveURL
+)   // 默认已开启后台任务保护，切后台也争取时间下完
 ```
 
 ### 后台任务保护
 
-App 切到后台时，关键请求（上传、识别等）希望仍有一段时间跑完。在请求里把 `runsInBackgroundTask` 设为 `true`，框架会用 `UIApplication.beginBackgroundTask` 包一层后台保护（非 UIKit 平台自动空操作）：
+用户何时切到后台不可控，所以 `runsInBackgroundTask` **默认就是 `true`**：框架会用 `UIApplication.beginBackgroundTask` 给每个请求包一层后台保护（非 UIKit 平台自动空操作）。个别确实不需要的接口可以显式关掉：
 
 ```swift
-struct UploadAPI: NetworkRequest {
-    typealias ResponseModel = UploadResult
-    var path = "/upload"
-    var method: HTTPMethod = .post
-    var runsInBackgroundTask: Bool { true }   // 切后台也争取时间完成
+struct PingAPI: NetworkRequest {
+    typealias ResponseModel = EmptyModel
+    var path = "/ping"
+    var runsInBackgroundTask: Bool { false }   // 这个接口不需要后台保护
 }
 ```
 
@@ -415,7 +413,7 @@ do {
 | `envelope` | 外层字段映射与成功判定 | 全局 `defaultEnvelope` |
 | `cachePolicy` | URL 缓存策略 | `.useProtocolCachePolicy` |
 | `ignoreGlobalInterceptors` | 是否忽略全局拦截器 | `false` |
-| `runsInBackgroundTask` | 是否在后台任务保护下执行 | `false` |
+| `runsInBackgroundTask` | 是否在后台任务保护下执行 | `true` |
 | `send()` | 发送请求（async） | 内置实现，一般无需重写 |
 
 ---
