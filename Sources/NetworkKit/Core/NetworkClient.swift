@@ -35,17 +35,25 @@ extension NetworkClient {
         }
 
         // 查询参数：显式 query/queryParameters；或无 body 的方法即便传了 body 参数也降级拼到 query
+        var items: [URLQueryItem] = []
         switch request.task {
         case .query(let params):
-            components.queryItems = try queryItems(fromEncodable: params)
+            items += try queryItems(fromEncodable: params)
         case .queryParameters(let dict):
-            components.queryItems = queryItems(fromDict: dict)
+            items += queryItems(fromDict: dict)
         case .jsonBody(let params) where request.method.prefersBodyEncoding == false:
-            components.queryItems = try queryItems(fromEncodable: params)
+            items += try queryItems(fromEncodable: params)
         case .jsonParameters(let dict) where request.method.prefersBodyEncoding == false:
-            components.queryItems = queryItems(fromDict: dict)
+            items += queryItems(fromDict: dict)
         case .none, .jsonBody, .jsonParameters, .rawBody:
             break
+        }
+        // urlParameters 始终附加，可与请求体共存
+        if !request.urlParameters.isEmpty {
+            items += queryItems(fromDict: request.urlParameters)
+        }
+        if !items.isEmpty {
+            components.queryItems = items
         }
 
         guard let url = components.url else { throw NetworkError.invalidURL }
@@ -138,19 +146,33 @@ extension NetworkClient {
     /// 拆外层壳 + 用 SmartCodable 解析数据为模型
     private func decode<R: NetworkRequest>(data: Data, request: R) throws -> R.ResponseModel {
         let envelope = request.envelope
+        // 实际解析路径：默认走 dataPath，遇到「无壳」场景会被改成整包解析
+        var effectiveDataPath = envelope.dataPath
 
         // 有业务码字段才做成功判定与拆包；否则直接整包解析
-        if envelope.codeKey != nil {
+        if let codeKey = envelope.codeKey {
             let object = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] ?? [:]
-            let code = envelope.resolveCode(in: object)
-            guard envelope.isSuccess(code) else {
-                let message = envelope.resolveMessage(in: object, isFailure: true)
-                log("❌ 业务失败 code=\(code.map(String.init) ?? "nil") message=\(message ?? "")")
-                throw NetworkError.business(code: code, message: message, raw: data)
+            let codeFieldExists = envelope.value(forKeyPath: codeKey, in: object) != nil
+            if codeFieldExists {
+                let code = envelope.resolveCode(in: object)
+                guard envelope.isSuccess(code) else {
+                    let message = envelope.resolveMessage(in: object, isFailure: true)
+                    log("❌ 业务失败 code=\(code.map(String.init) ?? "nil") message=\(message ?? "")")
+                    throw NetworkError.business(code: code, message: message, raw: data)
+                }
+            } else if envelope.parsesRawWhenCodeMissing {
+                // 没有外层壳：忽略 dataPath，直接整包解析
+                effectiveDataPath = nil
+            } else {
+                // 业务码字段缺失，仍按成功判定一次（保持严格行为）
+                guard envelope.isSuccess(nil) else {
+                    let message = envelope.resolveMessage(in: object, isFailure: true)
+                    throw NetworkError.business(code: nil, message: message, raw: data)
+                }
             }
         }
 
-        guard let model = R.ResponseModel.deserialize(from: data, designatedPath: envelope.dataPath) else {
+        guard let model = R.ResponseModel.deserialize(from: data, designatedPath: effectiveDataPath) else {
             throw NetworkError.decoding(message: "SmartCodable 解析为 \(R.ResponseModel.self) 失败", raw: data)
         }
         log("✅ 解析成功 \(R.ResponseModel.self)")

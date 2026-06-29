@@ -22,6 +22,8 @@ public struct ResponseEnvelope {
     public var errorMessageKey: String?
     /// 内容数据路径，直接传给 SmartCodable 的 designatedPath（如 "data"、"result.list"）；为 nil 表示整包解析
     public var dataPath: String?
+    /// 当响应里找不到 codeKey 字段时，是否跳过拆包、直接整包解析（兼容「有的接口包了外层壳、有的没包」）。默认 false
+    public var parsesRawWhenCodeMissing: Bool
     /// 成功判定：入参为解析出的业务码，返回 true 表示业务成功
     public var isSuccess: (_ code: Int?) -> Bool
 
@@ -31,18 +33,21 @@ public struct ResponseEnvelope {
     ///   - messageKey: 提示语字段名
     ///   - errorMessageKey: 失败提示语字段名（不传则回退 messageKey）
     ///   - dataPath: 内容数据路径（SmartCodable designatedPath）
+    ///   - parsesRawWhenCodeMissing: 找不到业务码字段时是否整包解析
     ///   - isSuccess: 成功判定闭包，默认 code == 0
     public init(
         codeKey: String? = "code",
         messageKey: String? = "message",
         errorMessageKey: String? = nil,
         dataPath: String? = "data",
+        parsesRawWhenCodeMissing: Bool = false,
         isSuccess: @escaping (_ code: Int?) -> Bool = { $0 == 0 }
     ) {
         self.codeKey = codeKey
         self.messageKey = messageKey
         self.errorMessageKey = errorMessageKey
         self.dataPath = dataPath
+        self.parsesRawWhenCodeMissing = parsesRawWhenCodeMissing
         self.isSuccess = isSuccess
     }
 

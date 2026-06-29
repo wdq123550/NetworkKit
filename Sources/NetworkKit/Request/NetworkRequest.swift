@@ -26,6 +26,8 @@ public protocol NetworkRequest {
     var method: HTTPMethod { get }
     /// 请求参数；默认无参数
     var task: RequestTask { get }
+    /// 额外的 URL 查询参数；始终拼到 URL 上、可与请求体共存（适合 POST 同时带 query 与 body 的接口）。默认空
+    var urlParameters: [String: Any] { get }
     /// 请求头（会叠加在全局默认头之上）；默认空
     var headers: [String: String] { get }
     /// 超时时间（秒）；默认取全局配置
@@ -52,6 +54,7 @@ extension NetworkRequest {
     public var host: String { NetworkConfiguration.shared.baseHost }
     public var method: HTTPMethod { .get }
     public var task: RequestTask { .none }
+    public var urlParameters: [String: Any] { [:] }
     public var headers: [String: String] { [:] }
     public var timeout: TimeInterval { NetworkConfiguration.shared.defaultTimeout }
     public var retryPolicy: RetryPolicy { NetworkConfiguration.shared.defaultRetryPolicy }

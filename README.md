@@ -153,6 +153,22 @@ var task: RequestTask { .jsonBody([1, 2, 3]) }
 
 > GET / HEAD 等无请求体的方法，即使传了 `jsonBody` / `jsonParameters`，也会自动降级拼到 URL query。
 
+### query 与 body 同时存在
+
+`task` 是「请求体」与「GET 查询」二选一的载体。如果某个接口（常见于网关签名接口）需要 **同时** 带 URL query 参数和 JSON body，用独立的 `urlParameters` 属性，它始终拼到 URL，且与 body 共存：
+
+```swift
+struct ChatAPI: NetworkRequest {
+    typealias ResponseModel = ChatResult
+    var path = "/api/v2/chat"
+    var method: HTTPMethod = .post
+    // 始终拼到 URL 的查询参数（与 body 共存）
+    var urlParameters: [String: Any] { ["api_key": apiKey, "timestamp": ts] }
+    // 请求体
+    var task: RequestTask { .jsonBody(Body(messages: messages)) }
+}
+```
+
 ---
 
 ## 五、外层字段映射（适配不同后端）
@@ -210,6 +226,21 @@ dataPath: "data.content"
 
 // 更深：{ "code": 0, "result": { "list": [...] } }
 dataPath: "result.list"
+```
+
+### 外层壳「有时有、有时没有」
+
+如果同一套接口里，有的返回 `{code, data}` 包了壳、有的直接返回裸数据，把 `parsesRawWhenCodeMissing` 设为 `true`：响应里能找到 `codeKey` 字段就正常拆包+成功判定，找不到就忽略 `dataPath`、整包解析成模型。
+
+```swift
+var envelope: ResponseEnvelope {
+    ResponseEnvelope(
+        codeKey: "error_code",
+        messageKey: "error_message",
+        dataPath: "data",
+        parsesRawWhenCodeMissing: true   // 没有外层壳时直接整包解析
+    )
+}
 ```
 
 如果大多数接口是一层、个别接口多一层，不必重写整套 `envelope`，用 `replacingDataPath` 只改路径、其余继承全局默认：
@@ -347,7 +378,8 @@ do {
 | `host` | 主机地址（含 scheme） | 全局 `baseHost` |
 | `path` | 接口路径 | 必填 |
 | `method` | HTTP 方法 | `.get` |
-| `task` | 请求参数 | `.none` |
+| `task` | 请求参数（body 或 GET query 二选一） | `.none` |
+| `urlParameters` | 始终拼到 URL 的查询参数（可与 body 共存） | `[:]` |
 | `headers` | 请求头（叠加在全局头之上） | `[:]` |
 | `timeout` | 超时（秒） | 全局 `defaultTimeout` |
 | `retryPolicy` | 重试策略 | 全局 `defaultRetryPolicy` |
