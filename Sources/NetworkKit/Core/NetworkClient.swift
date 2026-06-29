@@ -40,6 +40,25 @@ extension NetworkClient {
         return try decode(data: data, request: request)
     }
 
+    /// 发送请求并返回原始响应数据（不走 SmartCodable 解析，适合自定义解析的接口）
+    public func sendForData<R: NetworkRequest>(_ request: R) async throws -> Data {
+        guard request.runsInBackgroundTask else {
+            return try await sendForDataCore(request)
+        }
+        return try await BackgroundTaskRunner.run(name: "NetworkKit.sendForData.\(request.path)") {
+            try await sendForDataCore(request)
+        }
+    }
+
+    /// 返回原始数据的核心流程（含拦截器与状态码校验，仅跳过 SmartCodable 解析）
+    private func sendForDataCore<R: NetworkRequest>(_ request: R) async throws -> Data {
+        let urlRequest = try await buildURLRequest(for: request)
+        let (data, response) = try await performWithRetry(urlRequest, request: request)
+        try await runResponseInterceptors(data: data, response: response, urlRequest: urlRequest, request: request)
+        try validateHTTPStatus(response: response, data: data)
+        return data
+    }
+
     /// 组装 URLRequest（拼 URL、编码参数、铺 header、跑请求拦截器）
     private func buildURLRequest<R: NetworkRequest>(for request: R) async throws -> URLRequest {
         guard var components = URLComponents(string: request.host + request.path) else {

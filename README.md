@@ -362,6 +362,23 @@ struct PingAPI: NetworkRequest {
 }
 ```
 
+## 七点六、自定义解析（返回原始 Data）
+
+有些接口的返回结构很特殊（如字段里嵌套 JSON 字符串、需要手写解析），不适合 SmartCodable。这类请求可以不指定 `ResponseModel`（默认 `EmptyDecodable`），改用 `sendForData()` 拿原始 `Data` 自己解析；host/query/签名拦截器/重试/后台任务等能力照常生效：
+
+```swift
+struct LegacyListRequest: NetworkRequest {
+    // 不写 typealias ResponseModel，默认 EmptyDecodable
+    var host = "https://api.example.com"
+    var path = "/legacy/list"
+    var urlParameters: [String: Any] { ["api_key": key] }
+    var requestInterceptors: [RequestInterceptor] { [MySignatureInterceptor()] }
+}
+
+let data = try await LegacyListRequest().sendForData()
+let json = try JSONSerialization.jsonObject(with: data)   // 自定义解析
+```
+
 ## 八、错误处理
 
 所有错误都归一化成 `NetworkError`：

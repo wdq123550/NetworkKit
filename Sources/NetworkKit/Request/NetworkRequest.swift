@@ -8,6 +8,12 @@
 import Foundation
 import SmartCodable
 
+// MARK: - EmptyDecodable
+/// 空模型占位：用于只需要原始 Data、不走 SmartCodable 解析（sendForData）的请求，作为 ResponseModel 的默认类型
+public struct EmptyDecodable: SmartDecodable {
+    public init() {}
+}
+
 // MARK: - NetworkRequest
 /// 网络请求协议
 ///
@@ -16,7 +22,8 @@ import SmartCodable
 /// 协议扩展提供了全套默认实现（默认读取 `NetworkConfiguration.shared`），不重写就用默认值。
 public protocol NetworkRequest {
     /// 返回模型类型（遵守 SmartDecodable，用于自动解析返回数据；同时遵守 SmartEncodable 的 SmartCodableX 也满足）
-    associatedtype ResponseModel: SmartDecodable
+    /// 仅用 sendForData 自定义解析时可不指定，默认 EmptyDecodable
+    associatedtype ResponseModel: SmartDecodable = EmptyDecodable
 
     /// 主机地址（含 scheme，如 "https://api.example.com"）；默认取全局配置
     var host: String { get }
@@ -49,6 +56,8 @@ public protocol NetworkRequest {
 
     /// 发送请求并解析为返回模型（全程 async/await）
     func send() async throws -> ResponseModel
+    /// 发送请求并返回原始响应数据（不走 SmartCodable 解析，适合自定义解析的接口）
+    func sendForData() async throws -> Data
 }
 
 // MARK: - 默认实现
@@ -70,5 +79,10 @@ extension NetworkRequest {
     /// 默认发送实现：转交执行引擎
     public func send() async throws -> ResponseModel {
         try await NetworkClient.shared.send(self)
+    }
+
+    /// 默认实现：发送并返回原始 Data（不解析）
+    public func sendForData() async throws -> Data {
+        try await NetworkClient.shared.sendForData(self)
     }
 }
