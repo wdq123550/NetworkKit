@@ -41,6 +41,30 @@ public enum EncryptHelper {
         return base64Str
     }
 
+    /// Base64 URL-safe 字符串解码（与 `encodeBase64URLSafeString` 互逆，补回 = 与 +/）
+    public static func decodeBase64URLSafeString(_ base64String: String) -> Data? {
+        var base64 = base64String
+            .replacingOccurrences(of: "-", with: "+")
+            .replacingOccurrences(of: "_", with: "/")
+        let padding = (4 - base64.count % 4) % 4
+        base64 += String(repeating: "=", count: padding)
+        return Data(base64Encoded: base64)
+    }
+
+    /// DES 加密为二进制密文（密钥为 URL-safe Base64 编码，与 encodeRequestBody 的 UTF-8 明文 key 不同）
+    public static func encryptDESBinary(data: Data, base64DESKey: String) -> Data? {
+        guard let keyData = decodeBase64URLSafeString(base64DESKey) else { return nil }
+        var mutableData = data
+        return mutableData.enCrypt(algorithm: .DES, keyData: keyData)
+    }
+
+    /// DES 解密二进制密文（密钥为 URL-safe Base64 编码）
+    public static func decryptDESBinary(data: Data, base64DESKey: String) -> Data? {
+        guard let keyData = decodeBase64URLSafeString(base64DESKey) else { return nil }
+        var mutableData = data
+        return mutableData.deCrypt(algorithm: .DES, keyData: keyData)
+    }
+
     private static func createSignature(signatureKey: String, valueToDigest: String) -> String? {
         let data = valueToDigest.data(using: String.Encoding.utf8)
         if let data = data {
