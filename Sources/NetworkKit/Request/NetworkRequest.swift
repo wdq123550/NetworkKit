@@ -58,6 +58,8 @@ public protocol NetworkRequest {
     func send() async throws -> ResponseModel
     /// 发送请求并返回原始响应数据（不走 SmartCodable 解析，适合自定义解析的接口）
     func sendForData() async throws -> Data
+    /// 发送请求并返回原始响应数据 + HTTP 响应元信息（需要状态码等响应信息时用；非 HTTP 响应时 response 为 nil）
+    func sendForDataResponse() async throws -> (data: Data, response: HTTPURLResponse?)
 }
 
 // MARK: - 默认实现
@@ -84,5 +86,10 @@ extension NetworkRequest {
     /// 默认实现：发送并返回原始 Data（不解析）
     public func sendForData() async throws -> Data {
         try await NetworkClient.shared.sendForData(self)
+    }
+
+    /// 默认实现：发送并返回原始 Data + HTTP 响应元信息（不解析）
+    public func sendForDataResponse() async throws -> (data: Data, response: HTTPURLResponse?) {
+        try await NetworkClient.shared.sendForDataResponse(self)
     }
 }

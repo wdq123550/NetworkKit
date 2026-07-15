@@ -59,6 +59,26 @@ extension NetworkClient {
         return data
     }
 
+    /// 发送请求并返回原始响应数据 + HTTP 响应元信息（不走 SmartCodable 解析）。
+    /// 成功（2xx）时可从返回的 response 取状态码；非 2xx 会抛 NetworkError.httpStatus（其 code 即状态码）。
+    public func sendForDataResponse<R: NetworkRequest>(_ request: R) async throws -> (data: Data, response: HTTPURLResponse?) {
+        guard request.runsInBackgroundTask else {
+            return try await sendForDataResponseCore(request)
+        }
+        return try await BackgroundTaskRunner.run(name: "NetworkKit.sendForDataResponse.\(request.path)") {
+            try await sendForDataResponseCore(request)
+        }
+    }
+
+    /// 返回原始数据 + HTTP 响应的核心流程（含拦截器与状态码校验，仅跳过 SmartCodable 解析）
+    private func sendForDataResponseCore<R: NetworkRequest>(_ request: R) async throws -> (data: Data, response: HTTPURLResponse?) {
+        let urlRequest = try await buildURLRequest(for: request)
+        let (data, response) = try await performWithRetry(urlRequest, request: request)
+        try await runResponseInterceptors(data: data, response: response, urlRequest: urlRequest, request: request)
+        try validateHTTPStatus(response: response, data: data)
+        return (data, response as? HTTPURLResponse)
+    }
+
     /// 组装 URLRequest（拼 URL、编码参数、铺 header、跑请求拦截器）
     private func buildURLRequest<R: NetworkRequest>(for request: R) async throws -> URLRequest {
         guard var components = URLComponents(string: request.host + request.path) else {
