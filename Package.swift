@@ -27,6 +27,9 @@ let package = Package(
             name: "NetworkKit",
             dependencies: [
                 .product(name: "SmartCodable", package: "SmartCodable"),
+            ],
+            resources: [
+                .copy("PrivacyInfo.xcprivacy")
             ]
         ),
         .testTarget(
