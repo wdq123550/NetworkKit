@@ -339,13 +339,25 @@ SmartCodable 的容错是**静默**的：字段类型不符会自动转换、字
 NetworkConfiguration.shared.enableDecodingDiagnostics = true   // 开发期打开
 ```
 
-输出形如（仅 DEBUG 下打印，前缀 `[debugLog] NetworkKit 解析诊断`）：
+默认输出形如（仅 DEBUG 下打印，前缀 `[debugLog] SmartCodable 解析诊断`）：
 
 ```
-[debugLog] NetworkKit 解析诊断
+[debugLog] SmartCodable 解析诊断
 age 期望 Int 实际 String，已自动转换
 email 字段不存在，使用默认值
 ```
+
+> ⚠️ 这个开关底层是 SmartCodable 的 `SmartSentinel`，属于**全局设施**。打开后，App 内所有经 SmartCodable 的解析都会产生诊断日志，**不限于本库发起的请求**——直接调 `Model.deserialize(...)` 的地方同样会打。如果你的 App 里另有一套自己的字段对账逻辑，注意两边可能重复报同一个问题。
+
+宿主 App 有统一日志设施时，用 `decodingDiagnosticsHandler` 接管输出（不设则走上面的默认 print）：
+
+```swift
+NetworkConfiguration.shared.decodingDiagnosticsHandler = { diagnosticLog in
+    log(diagnosticLog, tag: "Decode")   // 换成你自己的日志函数
+}
+```
+
+出口是在回调触发时才读取的，所以先设 handler 还是先开开关都不影响结果。
 
 > 排查「模型字段莫名为空」这类问题时特别有用：建议开发期常开，发布前关掉。
 
@@ -542,7 +554,8 @@ do {
 | `globalRequestInterceptors` | 全局请求拦截器 |
 | `globalResponseInterceptors` | 全局返回拦截器 |
 | `enableLog` | 是否打印调试日志（仅 DEBUG） |
-| `enableDecodingDiagnostics` | 是否打印字段级解析诊断（默认 false，仅 DEBUG） |
+| `enableDecodingDiagnostics` | 是否输出字段级解析诊断（默认 false；底层 SmartSentinel 是全局设施） |
+| `decodingDiagnosticsHandler` | 解析诊断的输出出口（默认 nil，仅 DEBUG 下 print） |
 | `session` | 自定义底层 `URLSession` |
 
 ---

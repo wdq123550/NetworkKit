@@ -34,6 +34,9 @@ public final class NetworkConfiguration {
     @ObservationIgnored public var globalResponseInterceptors: [ResponseInterceptor] = []
     /// 是否打印调试日志（沿用项目 [debugLog] 风格）
     public var enableLog: Bool = false
+    /// 解析诊断日志的输出出口；为 nil 时仅在 DEBUG 下按 [debugLog] 风格打印
+    /// 宿主 App 有统一日志设施时在这里接管。注意诊断日志可能来自任意一处 SmartCodable 解析，不限于本库发起的请求
+    @ObservationIgnored public var decodingDiagnosticsHandler: ((String) -> Void)?
     /// 底层会话（默认用 .default 配置，可整体替换）
     @ObservationIgnored public var session: URLSession = .shared
 }
@@ -43,10 +46,13 @@ extension NetworkConfiguration {
     /// 模型解析的字段级诊断开关
     ///
     /// SmartCodable 的容错是静默的：某个字段类型不符或缺失时，它会自动转换或填默认值，不会报错。
-    /// 打开该开关后，SmartCodable 会逐字段打印诊断信息（如「age 期望 Int 实际 String，已自动转换」
-    /// 「email 字段不存在，使用默认值」），便于发现后端字段悄悄变更导致的模型空值。仅在 DEBUG 下输出。
+    /// 打开该开关后会逐字段输出诊断信息（如「age 期望 Int 实际 String，已自动转换」
+    /// 「email 字段不存在，使用默认值」），便于发现后端字段悄悄变更导致的模型空值。
     ///
-    /// 该开关不持有本地状态，读写直接作用于 SmartCodable 的 SmartSentinel，避免两处状态不同步。
+    /// 底层的 SmartSentinel 是 SmartCodable 的全局设施，因此开关一旦打开，App 内所有经 SmartCodable
+    /// 的解析都会产生诊断日志，并不限于本库发起的请求；日志去向由 `decodingDiagnosticsHandler` 决定。
+    ///
+    /// 该开关不持有本地状态，读写直接作用于 SmartSentinel，避免两处状态不同步。
     public var enableDecodingDiagnostics: Bool {
         get { SmartSentinel.debugMode != .none }
         set {
@@ -55,11 +61,25 @@ extension NetworkConfiguration {
                 return
             }
             SmartSentinel.debugMode = .verbose
+            // 回调里每次都重新读取输出出口，故设置 handler 与打开开关的先后顺序不影响结果
             SmartSentinel.onLogGenerated { diagnosticLog in
-                #if DEBUG
-                print("[debugLog] NetworkKit 解析诊断\n\(diagnosticLog)")
-                #endif
+                NetworkConfiguration.shared.emitDecodingDiagnostics(diagnosticLog)
             }
         }
+    }
+}
+
+// MARK: - 方法
+extension NetworkConfiguration {
+    /// 输出一条模型解析诊断日志：设置了自定义出口就交给它，否则在 DEBUG 下按 [debugLog] 风格打印
+    /// - Parameter diagnosticLog: SmartSentinel 生成的多行诊断文本
+    private func emitDecodingDiagnostics(_ diagnosticLog: String) {
+        guard let decodingDiagnosticsHandler else {
+            #if DEBUG
+            print("[debugLog] SmartCodable 解析诊断\n\(diagnosticLog)")
+            #endif
+            return
+        }
+        decodingDiagnosticsHandler(diagnosticLog)
     }
 }
