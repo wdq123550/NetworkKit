@@ -4,7 +4,7 @@
 
 - **底座**：原生 `URLSession`，零额外网络依赖
 - **并发**：全程 `async/await`，告别闭包与代理回调
-- **解析**：接入 [SmartCodable](https://github.com/iAmMccc/SmartCodable) 做强容错 JSON → 模型解析
+- **解析**：接入 [SmartCodable](https://github.com/iAmMccc/SmartCodable) 做强容错 JSON → 模型解析，支持全局/单请求两级解码选项与字段级解析诊断
 - **参数**：用 `Codable` 结构体或松散字典，自动编码成 JSON body / URL query
 - **协议化（而非继承）**：任意类型遵守 `NetworkRequest` 协议即获得完整请求能力。一个接口的全部信息（主机、路径、方法、参数、超时、重试、拦截器、外层字段映射、返回模型）都收敛在一个对象里，**看接口直接看这个类型**
 - **多后端兼容**：通过可配置的「外层字段映射」适配不同后端的 `code/message/data` 字段名与成功判定
@@ -64,6 +64,10 @@ func setupNetwork() {
     config.baseHost = "https://api.example.com"          // 默认主机
     config.defaultTimeout = 15                            // 默认超时（秒）
     config.enableLog = true                              // DEBUG 下打印请求日志
+    config.enableDecodingDiagnostics = true              // DEBUG 下打印字段级解析诊断（开发期建议开）
+
+    // 后端字段是下划线风格时，全局设一次即可（默认空集合＝按属性名原样匹配）
+    config.defaultDecodingOptions = [.key(.fromSnakeCase)]
 
     // 配置后端统一返回壳的字段映射（按你司后端字段名改）
     config.defaultEnvelope = ResponseEnvelope(
@@ -75,7 +79,7 @@ func setupNetwork() {
 }
 ```
 
-### 第 2 步：定义返回模型（遵守 SmartCodable）
+### 第 2 步：定义返回模型（遵守 SmartDecodable / SmartCodableX）
 
 ```swift
 import SmartCodable
@@ -86,6 +90,8 @@ struct UserInfo: SmartCodableX {   // 只需解析也可用 SmartDecodable
     var avatar: String = ""
 }
 ```
+
+> 单个模型作 `ResponseModel` 时遵守 `SmartDecodable` 就够了；但要把数组直接当 `ResponseModel`（如 `[Goods]`），元素类型**必须**遵守 `SmartCodableX`，详见「五、外层字段映射」里的「列表模型的协议约束」。
 
 ### 第 3 步：定义一个请求 = 一个遵守 `NetworkRequest` 的类型
 
@@ -211,7 +217,7 @@ struct LegacyAPI: NetworkRequest {
 var envelope: ResponseEnvelope { .raw }
 ```
 
-返回的内容数据会通过 SmartCodable 的 `designatedPath`（即 `dataPath`）自动定位并解析成 `ResponseModel`。
+返回的内容数据会通过 SmartCodable 的 `designatedPath`（即 `dataPath`）自动定位并解析成 `ResponseModel`；`dataPath` 为空时则整包解析。解析时套用的键名/日期等策略见「五点五、模型解析：解码选项与诊断」。
 
 ### 内容数据的层级（一层 / 多层都支持）
 
@@ -255,6 +261,93 @@ struct ProfileAPI: NetworkRequest {
     }
 }
 ```
+
+### 顶层直接返回数组的接口
+
+有些接口不带 `{code, data}` 外层壳，直接返回 `[{...}, {...}]` 这样的顶层数组。这类接口**不需要任何额外配置**：框架会识别出顶层不是 JSON 对象，自动跳过拆壳与业务码判定，整包解析成 `ResponseModel`。
+
+```swift
+// 后端直接返回：[{"id":1,...},{"id":2,...}]
+struct GoodsListAPI: NetworkRequest {
+    typealias ResponseModel = [Goods]
+    var path = "/goods/list"
+}
+```
+
+> 早期版本在全局配置了 `codeKey` 时会把这种响应误判为业务失败并抛 `NetworkError.business`，现已修复。
+
+### 列表模型的协议约束
+
+把数组直接当返回模型（如 `typealias ResponseModel = [Goods]`）时，元素类型 `Goods` **必须遵守 `SmartCodableX`**，只遵守 `SmartDecodable` 会编译不过：
+
+```swift
+struct Goods: SmartCodableX {    // 可用作 [Goods]
+    var id: Int = 0
+    var title: String = ""
+}
+
+struct Coupon: SmartDecodable {  // 单独用没问题，但用作 [Coupon] 会编译报错
+    var id: Int = 0
+}
+```
+
+原因：SmartCodable 7.0.0 只提供了 `extension Array: SmartCodableX where Element: SmartCodableX`，并没有为 `Element: SmartDecodable` 的数组提供协议遵守。`SmartCodableX` 是 `SmartDecodable & SmartEncodable` 的 typealias，多实现一个编码能力即可。
+
+> 另外，SmartCodable 7.0.0 里**没有**名为 `SmartCodable` 的协议（官方 README 部分示例是过时写法），实际可用的只有 `SmartDecodable`、`SmartEncodable`、`SmartCodableX` 三个。单个模型（非数组）作 `ResponseModel` 时，遵守 `SmartDecodable` 就够了。
+
+---
+
+## 五点五、模型解析：解码选项与诊断
+
+### 解码选项 `SmartDecodingOption`
+
+解析时的键名、日期、`Data`、浮点数策略通过 `Set<SmartDecodingOption>` 配置，分全局与单请求两级：
+
+```swift
+// 全局：App 启动配置里设一次，对所有请求生效
+NetworkConfiguration.shared.defaultDecodingOptions = [.key(.fromSnakeCase)]
+
+// 单请求：个别接口字段风格不一致时重写
+struct OrderDetailAPI: NetworkRequest {
+    typealias ResponseModel = Order
+    var path = "/order/detail"
+    // 这个老接口是首字母大写的字段名
+    var decodingOptions: Set<SmartDecodingOption> { [.key(.firstLetterLower)] }
+}
+```
+
+可选项：
+
+| 选项 | 说明 |
+| --- | --- |
+| `.key(.fromSnakeCase)` | 下划线转驼峰，`user_name` → `userName` |
+| `.key(.firstLetterLower)` | 首字母转小写，`UserName` → `userName` |
+| `.key(.firstLetterUpper)` | 首字母转大写 |
+| `.date(...)` | 日期策略，传 `JSONDecoder.DateDecodingStrategy`，如 `.date(.iso8601)`、`.date(.secondsSince1970)` |
+| `.data(.base64)` | `Data` 策略，传 `JSONDecoder.SmartDataDecodingStrategy` |
+| `.float(...)` | 浮点数策略，传 `JSONDecoder.NonConformingFloatDecodingStrategy`，处理 NaN / 无穷 |
+
+- 默认是**空集合**，即按模型属性名原样匹配 JSON 字段。
+- 每种策略只能设一个，重复设置以最后一个为准（如同时给两个 `.key(...)`，只有最后一个生效）。
+- 后端整体是下划线风格时，在启动配置里设一次 `[.key(.fromSnakeCase)]` 即可，不用给每个模型写 `mappingForKey`。
+
+### 解析诊断 `enableDecodingDiagnostics`
+
+SmartCodable 的容错是**静默**的：字段类型不符会自动转换、字段缺失会填默认值，都不报错。后端偷偷改了字段名时，你拿到的是一堆默认值，日志上却显示「解析成功」。打开诊断开关即可逐字段看到发生了什么：
+
+```swift
+NetworkConfiguration.shared.enableDecodingDiagnostics = true   // 开发期打开
+```
+
+输出形如（仅 DEBUG 下打印，前缀 `[debugLog] NetworkKit 解析诊断`）：
+
+```
+[debugLog] NetworkKit 解析诊断
+age 期望 Int 实际 String，已自动转换
+email 字段不存在，使用默认值
+```
+
+> 排查「模型字段莫名为空」这类问题时特别有用：建议开发期常开，发布前关掉。
 
 ---
 
@@ -428,6 +521,7 @@ do {
 | `requestInterceptors` | 该请求专属请求拦截器 | `[]` |
 | `responseInterceptors` | 该请求专属返回拦截器 | `[]` |
 | `envelope` | 外层字段映射与成功判定 | 全局 `defaultEnvelope` |
+| `decodingOptions` | 模型解码选项（键名/日期/Data/浮点数策略） | 全局 `defaultDecodingOptions` |
 | `cachePolicy` | URL 缓存策略 | `.useProtocolCachePolicy` |
 | `ignoreGlobalInterceptors` | 是否忽略全局拦截器 | `false` |
 | `runsInBackgroundTask` | 是否在后台任务保护下执行 | `true` |
@@ -443,10 +537,12 @@ do {
 | `defaultHeaders` | 默认请求头 |
 | `defaultTimeout` | 默认超时 |
 | `defaultEnvelope` | 默认外层字段映射 |
+| `defaultDecodingOptions` | 默认模型解码选项（默认空集合，按属性名原样匹配） |
 | `defaultRetryPolicy` | 默认重试策略 |
 | `globalRequestInterceptors` | 全局请求拦截器 |
 | `globalResponseInterceptors` | 全局返回拦截器 |
 | `enableLog` | 是否打印调试日志（仅 DEBUG） |
+| `enableDecodingDiagnostics` | 是否打印字段级解析诊断（默认 false，仅 DEBUG） |
 | `session` | 自定义底层 `URLSession` |
 
 ---
@@ -457,7 +553,7 @@ do {
 import NetworkKit
 import SmartCodable
 
-// 1. 模型
+// 1. 模型（要用作 [Article] 列表模型，必须遵守 SmartCodableX）
 struct Article: SmartCodableX {
     var id: Int = 0
     var title: String = ""
@@ -466,7 +562,7 @@ struct Article: SmartCodableX {
 
 // 2. 列表请求
 struct ArticleListAPI: NetworkRequest {
-    typealias ResponseModel = [Article]   // 数组也可解析
+    typealias ResponseModel = [Article]   // 数组也可解析（顶层直接返回数组同样支持）
 
     var path = "/articles"
     var method: HTTPMethod = .get

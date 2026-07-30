@@ -196,38 +196,56 @@ extension NetworkClient {
 
     /// 拆外层壳 + 用 SmartCodable 解析数据为模型
     private func decode<R: NetworkRequest>(data: Data, request: R) throws -> R.ResponseModel {
-        let envelope = request.envelope
-        // 实际解析路径：默认走 dataPath，遇到「无壳」场景会被改成整包解析
-        var effectiveDataPath = envelope.dataPath
+        // 整份 JSON 只反序列化一次，业务码判定与模型解析复用同一结果；顶层不是 JSON 对象（如接口直接返回数组）时为 nil
+        let rootDictionary = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
+        let dataPath = try resolveDataPath(envelope: request.envelope, rootDictionary: rootDictionary, rawData: data)
 
-        // 有业务码字段才做成功判定与拆包；否则直接整包解析
-        if let codeKey = envelope.codeKey {
-            let object = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] ?? [:]
-            let codeFieldExists = envelope.value(forKeyPath: codeKey, in: object) != nil
-            if codeFieldExists {
-                let code = envelope.resolveCode(in: object)
-                guard envelope.isSuccess(code) else {
-                    let message = envelope.resolveMessage(in: object, isFailure: true)
-                    log("❌ 业务失败 code=\(code.map(String.init) ?? "nil") message=\(message ?? "")")
-                    throw NetworkError.business(code: code, message: message, raw: data)
-                }
-            } else if envelope.parsesRawWhenCodeMissing {
-                // 没有外层壳：忽略 dataPath，直接整包解析
-                effectiveDataPath = nil
-            } else {
-                // 业务码字段缺失，仍按成功判定一次（保持严格行为）
-                guard envelope.isSuccess(nil) else {
-                    let message = envelope.resolveMessage(in: object, isFailure: true)
-                    throw NetworkError.business(code: nil, message: message, raw: data)
-                }
-            }
+        // 顶层是字典就复用已反序列化的结果，其余形态回落到用原始 Data 解析
+        let model: R.ResponseModel?
+        if let rootDictionary {
+            model = R.ResponseModel.deserialize(from: rootDictionary, designatedPath: dataPath, options: request.decodingOptions)
+        } else {
+            model = R.ResponseModel.deserialize(from: data, designatedPath: dataPath, options: request.decodingOptions)
         }
 
-        guard let model = R.ResponseModel.deserialize(from: data, designatedPath: effectiveDataPath) else {
-            throw NetworkError.decoding(message: "SmartCodable 解析为 \(R.ResponseModel.self) 失败", raw: data)
+        guard let model else {
+            let pathDescription = dataPath.map { "解析路径 \($0)" } ?? "整包解析"
+            throw NetworkError.decoding(message: "SmartCodable 解析为 \(R.ResponseModel.self) 失败（\(pathDescription)）", raw: data)
         }
         log("✅ 解析成功 \(R.ResponseModel.self)")
         return model
+    }
+
+    /// 校验外层壳的业务码，并给出模型的实际解析路径
+    /// - Parameters:
+    ///   - envelope: 当前请求的外层字段映射与成功判定配置
+    ///   - rootDictionary: 已反序列化的顶层字典；顶层不是 JSON 对象时为 nil
+    ///   - rawData: 原始响应数据，业务失败时随错误回传
+    /// - Returns: 模型的实际解析路径，nil 表示整包解析
+    private func resolveDataPath(envelope: ResponseEnvelope, rootDictionary: [String: Any]?, rawData: Data) throws -> String? {
+        // 未配置业务码字段：无需做成功判定，按配置的路径解析
+        guard let codeKey = envelope.codeKey else { return envelope.dataPath }
+        // 顶层不是 JSON 对象（如接口直接返回一个数组）：没有外层壳可拆，整包解析
+        guard let rootDictionary else { return nil }
+
+        let codeFieldExists = envelope.value(forKeyPath: codeKey, in: rootDictionary) != nil
+        guard codeFieldExists else {
+            // 响应里找不到业务码字段：按配置决定是整包解析，还是仍走一次成功判定（保持严格行为）
+            if envelope.parsesRawWhenCodeMissing { return nil }
+            guard envelope.isSuccess(nil) else {
+                let message = envelope.resolveMessage(in: rootDictionary, isFailure: true)
+                throw NetworkError.business(code: nil, message: message, raw: rawData)
+            }
+            return envelope.dataPath
+        }
+
+        let code = envelope.resolveCode(in: rootDictionary)
+        guard envelope.isSuccess(code) else {
+            let message = envelope.resolveMessage(in: rootDictionary, isFailure: true)
+            log("❌ 业务失败 code=\(code.map(String.init) ?? "nil") message=\(message ?? "")")
+            throw NetworkError.business(code: code, message: message, raw: rawData)
+        }
+        return envelope.dataPath
     }
 }
 

@@ -23,6 +23,9 @@ public struct EmptyDecodable: SmartDecodable {
 public protocol NetworkRequest {
     /// 返回模型类型（遵守 SmartDecodable，用于自动解析返回数据；同时遵守 SmartEncodable 的 SmartCodableX 也满足）
     /// 仅用 sendForData 自定义解析时可不指定，默认 EmptyDecodable
+    ///
+    /// 列表接口要把数组直接当返回模型（如 `[Goods]`）时，元素类型必须遵守 `SmartCodableX` 而非 `SmartDecodable`：
+    /// SmartCodable 只为 `Array where Element: SmartCodableX` 提供了协议遵守，元素仅遵守 `SmartDecodable` 时数组不满足本约束。
     associatedtype ResponseModel: SmartDecodable = EmptyDecodable
 
     /// 主机地址（含 scheme，如 "https://api.example.com"）；默认取全局配置
@@ -47,6 +50,8 @@ public protocol NetworkRequest {
     var responseInterceptors: [ResponseInterceptor] { get }
     /// 外层字段映射与成功判定；默认取全局配置（可单请求重写成功码等）
     var envelope: ResponseEnvelope { get }
+    /// 该请求专属的模型解码选项（键名策略、日期策略等）；默认取全局配置，个别接口字段风格不一致时可单独重写
+    var decodingOptions: Set<SmartDecodingOption> { get }
     /// URL 缓存策略；默认遵循协议缓存
     var cachePolicy: URLRequest.CachePolicy { get }
     /// 是否忽略全局拦截器（特殊接口如登录/刷新 token 可置 true）；默认 false
@@ -74,6 +79,7 @@ extension NetworkRequest {
     public var requestInterceptors: [RequestInterceptor] { [] }
     public var responseInterceptors: [ResponseInterceptor] { [] }
     public var envelope: ResponseEnvelope { NetworkConfiguration.shared.defaultEnvelope }
+    public var decodingOptions: Set<SmartDecodingOption> { NetworkConfiguration.shared.defaultDecodingOptions }
     public var cachePolicy: URLRequest.CachePolicy { .useProtocolCachePolicy }
     public var ignoreGlobalInterceptors: Bool { false }
     public var runsInBackgroundTask: Bool { true }
