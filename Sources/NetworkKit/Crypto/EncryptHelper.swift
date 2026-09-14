@@ -21,13 +21,10 @@ public enum EncryptHelper {
         return base64Str
     }
 
-    /// 按「请求方法 + path + query + body」计算 HMAC-SHA256 签名（Base64 URL-safe）
+    /// 按「请求方法 + path + query + body」计算 HMAC-SHA256 签名（Base64 URL-safe）。
+    /// 与 `HMACSignatureInterceptor` 的默认口径完全一致；在请求管道里优先直接挂拦截器，这里保留给手工组包的场景
     public static func getSignature(request: URLRequest, requestBody payload: String, signatureKey: String) -> String {
-        let httpMethod = request.httpMethod ?? "POST"
-        let path = request.url?.path ?? ""
-        let query = request.url?.query ?? ""
-
-        let valueToDigest = "\(httpMethod)\n\(path)\n\(query)\n\(payload)"
+        let valueToDigest = HMACSignatureInterceptor.methodPathQueryBody(request, payload)
         let signature = createSignature(signatureKey: signatureKey, valueToDigest: valueToDigest)
         return signature ?? ""
     }

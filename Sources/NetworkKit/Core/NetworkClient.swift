@@ -2,321 +2,252 @@
 //  NetworkClient.swift
 //  NetworkKit
 //
-//  请求执行引擎：组请求 / 拦截 / 重试 / 拆包 / SmartCodable 解析
+//  请求执行引擎：组包 / 变换 / 拦截 / 发送 / 重试 / 校验 / 解析
 //
 
 import Foundation
 import SmartCodable
 
-public final class NetworkClient {
-    // MARK: - 存储属性
+//MARK: - NetworkClient
+/// 请求执行引擎。本身无状态（配置全部来自请求的 `configuration`），一般直接用 `shared`
+public final class NetworkClient: @unchecked Sendable {
+    //MARK: - 存储属性
     /// 单例实例
     public static let shared = NetworkClient()
-    private init() {}
-    /// 请求体/查询参数编码器
+    /// 请求体 / 查询参数编码器
     private let encoder = JSONEncoder()
-    /// 文件下载并发限制器（默认最多 3 个并发）
-    private let downloadLimiter = DownloadLimiter(maxConcurrent: 3)
+    /// 每份配置对应一个下载并发限制器（按配置对象身份区分）
+    private let downloadSemaphores = LockedValue<[ObjectIdentifier: AsyncSemaphore]>([:])
+
+    /// 创建一个独立的执行引擎（通常不需要，用 `shared` 即可）
+    public init() {}
 }
 
-// MARK: - 方法
+//MARK: - PreparedRequest
+private extension NetworkClient {
+    /// 一次尝试组好的请求：拦截器改写后的 URLRequest + 变换前的原始请求体
+    struct PreparedRequest {
+        /// 实际发出的请求
+        var urlRequest: URLRequest
+        /// 参数编码后、任何改写之前的原始请求体
+        let originalBody: Data?
+    }
+}
+
+//MARK: - 发送
 extension NetworkClient {
-    /// 发送请求并解析为返回模型
+    /// 发送请求并返回完整响应（不解析模型）
+    public func response<R: NetworkRequest>(for request: R) async throws -> NetworkResponse {
+        guard request.runsInBackgroundTask else {
+            return try await responseCore(request)
+        }
+        return try await BackgroundTaskRunner.run(name: "NetworkKit.\(request.name)") {
+            try await responseCore(request)
+        }
+    }
+
+    /// 发送请求并按 envelope 拆壳、解析为返回模型
     public func send<R: NetworkRequest>(_ request: R) async throws -> R.ResponseModel {
-        guard request.runsInBackgroundTask else {
-            return try await sendCore(request)
+        let response = try await response(for: request)
+        let monitors = request.configuration.effectiveEventMonitors
+        do {
+            let model = try response.decode(R.ResponseModel.self)
+            monitors.responseDidDecode(modelType: R.ResponseModel.self, error: nil, context: response.context)
+            return model
+        } catch {
+            let networkError = NetworkError.normalize(error)
+            monitors.responseDidDecode(modelType: R.ResponseModel.self, error: networkError, context: response.context)
+            throw networkError
         }
-        return try await BackgroundTaskRunner.run(name: "NetworkKit.send.\(request.path)") {
-            try await sendCore(request)
+    }
+}
+
+//MARK: - 发送管道
+private extension NetworkClient {
+    /// 核心流程：带重试地「组包 → 拦截 → 发送 → 响应拦截 → 校验状态码 → 变换响应体」
+    func responseCore<R: NetworkRequest>(_ request: R) async throws -> NetworkResponse {
+        let configuration = request.configuration
+        let monitors = configuration.effectiveEventMonitors
+        let policy = request.retryPolicy
+        let startTime = Date()
+        let descriptor = RequestDescriptor(
+            name: request.name,
+            host: request.host,
+            path: request.path,
+            method: request.method,
+            timeout: request.timeout
+        )
+        var attempt = 0
+        var lastPrepared: PreparedRequest?
+
+        while true {
+            // 组包：首发必组；重试时按策略决定重组还是复用上一次的最终请求
+            var context = RequestContext(descriptor: descriptor, originalBody: lastPrepared?.originalBody, attempt: attempt, startTime: startTime)
+            do {
+                let prepared: PreparedRequest
+                if let lastPrepared, policy.rebuildsRequestOnRetry == false {
+                    prepared = lastPrepared
+                } else {
+                    var base = try buildBaseRequest(for: request, configuration: configuration)
+                    context = RequestContext(descriptor: descriptor, originalBody: base.originalBody, attempt: attempt, startTime: startTime)
+                    if let body = base.originalBody {
+                        base.urlRequest.httpBody = try request.transformRequestBody(body)
+                    }
+                    try await runRequestInterceptors(&base.urlRequest, request: request, configuration: configuration, context: context)
+                    prepared = base
+                }
+                lastPrepared = prepared
+
+                monitors.requestWillSend(prepared.urlRequest, context: context)
+                let (data, urlResponse) = try await configuration.session.data(for: prepared.urlRequest)
+                var response = NetworkResponse(
+                    data: data,
+                    httpResponse: urlResponse as? HTTPURLResponse,
+                    urlRequest: prepared.urlRequest,
+                    context: context,
+                    elapsed: Date().timeIntervalSince(startTime),
+                    envelope: request.envelope,
+                    decodingOptions: request.decodingOptions
+                )
+                try await runResponseInterceptors(&response, request: request, configuration: configuration)
+                try validateStatusCode(of: response, acceptable: request.acceptableStatusCodes)
+                response.data = try request.transformResponseBody(response.data, response: response.httpResponse)
+                monitors.requestDidFinish(.success(response), context: context)
+                return response
+            } catch {
+                let networkError = NetworkError.normalize(error)
+                guard networkError.isCancelled == false,
+                      attempt < policy.maxRetryCount,
+                      policy.shouldRetry(networkError, attempt) else {
+                    monitors.requestDidFinish(.failure(networkError), context: context)
+                    throw networkError
+                }
+                attempt += 1
+                let delay = policy.delay.interval(forRetry: attempt)
+                monitors.requestWillRetry(after: networkError, delay: delay, context: context)
+                if delay > 0 {
+                    do {
+                        try await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
+                    } catch {
+                        monitors.requestDidFinish(.failure(.cancelled), context: context)
+                        throw NetworkError.cancelled
+                    }
+                }
+            }
         }
     }
 
-    /// 发送请求的核心流程
-    private func sendCore<R: NetworkRequest>(_ request: R) async throws -> R.ResponseModel {
-        let urlRequest = try await buildURLRequest(for: request)
-        let (data, response) = try await performWithRetry(urlRequest, request: request)
-        try await runResponseInterceptors(data: data, response: response, urlRequest: urlRequest, request: request)
-        try validateHTTPStatus(response: response, data: data)
-        return try decode(data: data, request: request)
-    }
-
-    /// 发送请求并返回原始响应数据（不走 SmartCodable 解析，适合自定义解析的接口）
-    public func sendForData<R: NetworkRequest>(_ request: R) async throws -> Data {
-        guard request.runsInBackgroundTask else {
-            return try await sendForDataCore(request)
-        }
-        return try await BackgroundTaskRunner.run(name: "NetworkKit.sendForData.\(request.path)") {
-            try await sendForDataCore(request)
-        }
-    }
-
-    /// 返回原始数据的核心流程（含拦截器与状态码校验，仅跳过 SmartCodable 解析）
-    private func sendForDataCore<R: NetworkRequest>(_ request: R) async throws -> Data {
-        let urlRequest = try await buildURLRequest(for: request)
-        let (data, response) = try await performWithRetry(urlRequest, request: request)
-        try await runResponseInterceptors(data: data, response: response, urlRequest: urlRequest, request: request)
-        try validateHTTPStatus(response: response, data: data)
-        return data
-    }
-
-    /// 发送请求并返回原始响应数据 + HTTP 响应元信息（不走 SmartCodable 解析）。
-    /// 成功（2xx）时可从返回的 response 取状态码；非 2xx 会抛 NetworkError.httpStatus（其 code 即状态码）。
-    public func sendForDataResponse<R: NetworkRequest>(_ request: R) async throws -> (data: Data, response: HTTPURLResponse?) {
-        guard request.runsInBackgroundTask else {
-            return try await sendForDataResponseCore(request)
-        }
-        return try await BackgroundTaskRunner.run(name: "NetworkKit.sendForDataResponse.\(request.path)") {
-            try await sendForDataResponseCore(request)
-        }
-    }
-
-    /// 返回原始数据 + HTTP 响应的核心流程（含拦截器与状态码校验，仅跳过 SmartCodable 解析）
-    private func sendForDataResponseCore<R: NetworkRequest>(_ request: R) async throws -> (data: Data, response: HTTPURLResponse?) {
-        let urlRequest = try await buildURLRequest(for: request)
-        let (data, response) = try await performWithRetry(urlRequest, request: request)
-        try await runResponseInterceptors(data: data, response: response, urlRequest: urlRequest, request: request)
-        try validateHTTPStatus(response: response, data: data)
-        return (data, response as? HTTPURLResponse)
-    }
-
-    /// 组装 URLRequest（拼 URL、编码参数、铺 header、跑请求拦截器）
-    private func buildURLRequest<R: NetworkRequest>(for request: R) async throws -> URLRequest {
+    /// 组装基础 URLRequest（拼 URL、编码参数、铺 header），不跑拦截器与变换
+    func buildBaseRequest<R: NetworkRequest>(for request: R, configuration: NetworkConfiguration) throws -> PreparedRequest {
         guard var components = URLComponents(string: request.host + request.path) else {
             throw NetworkError.invalidURL
         }
+        let queryOptions = configuration.queryEncoding
 
-        // 查询参数：显式 query/queryParameters；或无 body 的方法即便传了 body 参数也降级拼到 query
+        // 查询参数：显式 query 类；或无请求体的方法即便传了 body 类参数也降级拼到 query
         var items: [URLQueryItem] = []
         switch request.task {
         case .query(let params):
-            items += try queryItems(fromEncodable: params)
+            items += try QueryEncoder.queryItems(from: params, encoder: encoder, options: queryOptions)
         case .queryParameters(let dict):
-            items += queryItems(fromDict: dict)
+            items += QueryEncoder.queryItems(from: dict, options: queryOptions)
         case .jsonBody(let params) where request.method.prefersBodyEncoding == false:
-            items += try queryItems(fromEncodable: params)
-        case .jsonParameters(let dict) where request.method.prefersBodyEncoding == false:
-            items += queryItems(fromDict: dict)
-        case .none, .jsonBody, .jsonParameters, .rawBody:
+            items += try QueryEncoder.queryItems(from: params, encoder: encoder, options: queryOptions)
+        case .jsonParameters(let dict) where request.method.prefersBodyEncoding == false,
+             .formParameters(let dict) where request.method.prefersBodyEncoding == false:
+            items += QueryEncoder.queryItems(from: dict, options: queryOptions)
+        case .none, .jsonBody, .jsonParameters, .formParameters, .multipart, .rawBody:
             break
         }
         // urlParameters 始终附加，可与请求体共存
-        if !request.urlParameters.isEmpty {
-            items += queryItems(fromDict: request.urlParameters)
+        if request.urlParameters.isEmpty == false {
+            items += QueryEncoder.queryItems(from: request.urlParameters, options: queryOptions)
         }
-        if !items.isEmpty {
+        if items.isEmpty == false {
             components.queryItems = items
+            components.percentEncodedQuery = QueryEncoder.percentEncodedQuery(of: components, options: queryOptions)
         }
-
         guard let url = components.url else { throw NetworkError.invalidURL }
 
         var urlRequest = URLRequest(url: url, cachePolicy: request.cachePolicy, timeoutInterval: request.timeout)
         urlRequest.httpMethod = request.method.rawValue
 
-        // header：全局默认 -> 请求自定义
-        var headers = NetworkConfiguration.shared.defaultHeaders
-        for (key, value) in request.headers { headers[key] = value }
-        for (key, value) in headers { urlRequest.setValue(value, forHTTPHeaderField: key) }
-
-        // 请求体：仅在支持 body 的方法上设置
+        // header：配置默认头 → 参数承载方式决定的 Content-Type → 请求自定义头
+        var headers = configuration.defaultHeaders
+        var originalBody: Data?
         if request.method.prefersBodyEncoding {
             switch request.task {
             case .jsonBody(let params):
-                urlRequest.httpBody = try encodeBody(fromEncodable: params)
+                originalBody = try encodeJSONBody(fromEncodable: params)
+                headers["Content-Type"] = "application/json"
             case .jsonParameters(let dict):
-                urlRequest.httpBody = try encodeBody(fromDict: dict)
-            case .rawBody(let data):
-                urlRequest.httpBody = data
+                originalBody = try encodeJSONBody(fromDict: dict)
+                headers["Content-Type"] = "application/json"
+            case .formParameters(let dict):
+                let formItems = QueryEncoder.queryItems(from: dict, options: queryOptions)
+                originalBody = QueryEncoder.formBody(from: formItems, options: queryOptions)
+                headers["Content-Type"] = "application/x-www-form-urlencoded; charset=utf-8"
+            case .multipart(let form):
+                originalBody = form.encoded()
+                headers["Content-Type"] = form.contentType
+            case .rawBody(let data, let contentType):
+                originalBody = data
+                if let contentType { headers["Content-Type"] = contentType }
             case .none, .query, .queryParameters:
                 break
             }
         }
+        for (key, value) in request.headers { headers[key] = value }
+        for (key, value) in headers { urlRequest.setValue(value, forHTTPHeaderField: key) }
+        urlRequest.httpBody = originalBody
 
-        try await runRequestInterceptors(&urlRequest, request: request)
-        log("➡️ \(request.method.rawValue) \(url.absoluteString)")
-        return urlRequest
+        return PreparedRequest(urlRequest: urlRequest, originalBody: originalBody)
     }
 
     /// 执行请求拦截器（全局在前，请求自身在后）
-    private func runRequestInterceptors<R: NetworkRequest>(_ urlRequest: inout URLRequest, request: R) async throws {
-        if !request.ignoreGlobalInterceptors {
-            for interceptor in NetworkConfiguration.shared.globalRequestInterceptors {
-                try await interceptor.intercept(&urlRequest)
-            }
+    func runRequestInterceptors<R: NetworkRequest>(
+        _ urlRequest: inout URLRequest,
+        request: R,
+        configuration: NetworkConfiguration,
+        context: RequestContext
+    ) async throws {
+        let policy = request.globalInterceptorPolicy
+        for interceptor in configuration.globalRequestInterceptors where policy.allows(interceptor) {
+            try await interceptor.intercept(&urlRequest, context: context)
         }
         for interceptor in request.requestInterceptors {
-            try await interceptor.intercept(&urlRequest)
+            try await interceptor.intercept(&urlRequest, context: context)
         }
     }
 
-    /// 执行返回拦截器（全局在前，请求自身在后）
-    private func runResponseInterceptors<R: NetworkRequest>(data: Data, response: URLResponse, urlRequest: URLRequest, request: R) async throws {
-        if !request.ignoreGlobalInterceptors {
-            for interceptor in NetworkConfiguration.shared.globalResponseInterceptors {
-                try await interceptor.intercept(data: data, response: response, for: urlRequest)
-            }
+    /// 执行响应拦截器（全局在前，请求自身在后）
+    func runResponseInterceptors<R: NetworkRequest>(
+        _ response: inout NetworkResponse,
+        request: R,
+        configuration: NetworkConfiguration
+    ) async throws {
+        let policy = request.globalInterceptorPolicy
+        for interceptor in configuration.globalResponseInterceptors where policy.allows(interceptor) {
+            try await interceptor.intercept(&response)
         }
         for interceptor in request.responseInterceptors {
-            try await interceptor.intercept(data: data, response: response, for: urlRequest)
+            try await interceptor.intercept(&response)
         }
     }
 
-    /// 带重试的请求执行
-    private func performWithRetry<R: NetworkRequest>(_ urlRequest: URLRequest, request: R) async throws -> (Data, URLResponse) {
-        let policy = request.retryPolicy
-        var retriedCount = 0
-        while true {
-            do {
-                return try await perform(urlRequest)
-            } catch {
-                let mappedError = mapTransportError(error)
-                guard retriedCount < policy.maxRetryCount, policy.shouldRetry(mappedError, retriedCount) else {
-                    throw mappedError
-                }
-                retriedCount += 1
-                log("🔁 第 \(retriedCount) 次重试：\(mappedError.localizedDescription)")
-                if policy.retryDelay > 0 {
-                    try await Task.sleep(nanoseconds: UInt64(policy.retryDelay * 1_000_000_000))
-                }
-            }
-        }
-    }
-
-    /// 单次发送
-    private func perform(_ urlRequest: URLRequest) async throws -> (Data, URLResponse) {
-        try await NetworkConfiguration.shared.session.data(for: urlRequest)
-    }
-
-    /// 校验 HTTP 状态码（非 2xx 视为 httpStatus 错误）
-    private func validateHTTPStatus(response: URLResponse, data: Data) throws {
-        guard let httpResponse = response as? HTTPURLResponse else { return }
-        guard (200..<300).contains(httpResponse.statusCode) else {
-            throw NetworkError.httpStatus(code: httpResponse.statusCode, data: data)
-        }
-    }
-
-    /// 拆外层壳 + 用 SmartCodable 解析数据为模型
-    private func decode<R: NetworkRequest>(data: Data, request: R) throws -> R.ResponseModel {
-        // 整份 JSON 只反序列化一次，业务码判定与模型解析复用同一结果；顶层不是 JSON 对象（如接口直接返回数组）时为 nil
-        let rootDictionary = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
-        let dataPath = try resolveDataPath(envelope: request.envelope, rootDictionary: rootDictionary, rawData: data)
-
-        // 顶层是字典就复用已反序列化的结果，其余形态回落到用原始 Data 解析
-        let model: R.ResponseModel?
-        if let rootDictionary {
-            model = R.ResponseModel.deserialize(from: rootDictionary, designatedPath: dataPath, options: request.decodingOptions)
-        } else {
-            model = R.ResponseModel.deserialize(from: data, designatedPath: dataPath, options: request.decodingOptions)
-        }
-
-        guard let model else {
-            let pathDescription = dataPath.map { "解析路径 \($0)" } ?? "整包解析"
-            throw NetworkError.decoding(message: "SmartCodable 解析为 \(R.ResponseModel.self) 失败（\(pathDescription)）", raw: data)
-        }
-        log("✅ 解析成功 \(R.ResponseModel.self)")
-        return model
-    }
-
-    /// 校验外层壳的业务码，并给出模型的实际解析路径
-    /// - Parameters:
-    ///   - envelope: 当前请求的外层字段映射与成功判定配置
-    ///   - rootDictionary: 已反序列化的顶层字典；顶层不是 JSON 对象时为 nil
-    ///   - rawData: 原始响应数据，业务失败时随错误回传
-    /// - Returns: 模型的实际解析路径，nil 表示整包解析
-    private func resolveDataPath(envelope: ResponseEnvelope, rootDictionary: [String: Any]?, rawData: Data) throws -> String? {
-        // 未配置业务码字段：无需做成功判定，按配置的路径解析
-        guard let codeKey = envelope.codeKey else { return envelope.dataPath }
-        // 顶层不是 JSON 对象（如接口直接返回一个数组）：没有外层壳可拆，整包解析
-        guard let rootDictionary else { return nil }
-
-        let codeFieldExists = envelope.value(forKeyPath: codeKey, in: rootDictionary) != nil
-        guard codeFieldExists else {
-            // 响应里找不到业务码字段：按配置决定是整包解析，还是仍走一次成功判定（保持严格行为）
-            if envelope.parsesRawWhenCodeMissing { return nil }
-            guard envelope.isSuccess(nil) else {
-                let message = envelope.resolveMessage(in: rootDictionary, isFailure: true)
-                throw NetworkError.business(code: nil, message: message, raw: rawData)
-            }
-            return envelope.dataPath
-        }
-
-        let code = envelope.resolveCode(in: rootDictionary)
-        guard envelope.isSuccess(code) else {
-            let message = envelope.resolveMessage(in: rootDictionary, isFailure: true)
-            log("❌ 业务失败 code=\(code.map(String.init) ?? "nil") message=\(message ?? "")")
-            throw NetworkError.business(code: code, message: message, raw: rawData)
-        }
-        return envelope.dataPath
-    }
-}
-
-// MARK: - 文件下载
-extension NetworkClient {
-    /// 下载文件到指定本地路径
-    /// - Parameters:
-    ///   - urlString: 文件完整地址
-    ///   - destination: 保存到的本地文件 URL（已存在会被覆盖）
-    ///   - headers: 额外请求头（不叠加全局默认头，下载通常无需）
-    ///   - timeout: 超时（秒）；nil 则用会话默认
-    ///   - runsInBackgroundTask: 是否在后台任务保护下执行；默认 true
-    /// - Returns: 下载完成后的本地文件 URL
-    @discardableResult
-    public func download(
-        from urlString: String,
-        to destination: URL,
-        headers: [String: String] = [:],
-        timeout: TimeInterval? = nil,
-        runsInBackgroundTask: Bool = true
-    ) async throws -> URL {
-        guard runsInBackgroundTask else {
-            return try await performDownload(from: urlString, to: destination, headers: headers, timeout: timeout)
-        }
-        return try await BackgroundTaskRunner.run(name: "NetworkKit.download") {
-            try await performDownload(from: urlString, to: destination, headers: headers, timeout: timeout)
-        }
-    }
-
-    /// 实际下载逻辑（受并发限制器约束，最多 3 个并发）
-    private func performDownload(
-        from urlString: String,
-        to destination: URL,
-        headers: [String: String],
-        timeout: TimeInterval?
-    ) async throws -> URL {
-        guard let url = URL(string: urlString) else { throw NetworkError.invalidURL }
-
-        await downloadLimiter.acquire()
-        defer { Task { await downloadLimiter.release() } }
-
-        var urlRequest = URLRequest(url: url)
-        if let timeout { urlRequest.timeoutInterval = timeout }
-        for (key, value) in headers { urlRequest.setValue(value, forHTTPHeaderField: key) }
-
-        do {
-            let (tempURL, response) = try await NetworkConfiguration.shared.session.download(for: urlRequest)
-            if let http = response as? HTTPURLResponse, !(200..<300).contains(http.statusCode) {
-                throw NetworkError.httpStatus(code: http.statusCode, data: Data())
-            }
-            // 确保目录存在；已有同名文件先删除再移动
-            let directory = destination.deletingLastPathComponent()
-            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
-            if FileManager.default.fileExists(atPath: destination.path) {
-                try FileManager.default.removeItem(at: destination)
-            }
-            try FileManager.default.moveItem(at: tempURL, to: destination)
-            log("⬇️ 下载完成 \(url.absoluteString)")
-            return destination
-        } catch let error as NetworkError {
-            throw error
-        } catch {
-            throw mapTransportError(error)
+    /// 校验 HTTP 状态码（不在可接受范围内视为 httpStatus 错误；非 HTTP 响应不校验）
+    func validateStatusCode(of response: NetworkResponse, acceptable: Range<Int>) throws {
+        guard let statusCode = response.statusCode else { return }
+        guard acceptable.contains(statusCode) else {
+            throw NetworkError.httpStatus(code: statusCode, data: response.data)
         }
     }
 }
 
-// MARK: - 编码辅助方法
-extension NetworkClient {
+//MARK: - 编码辅助方法
+private extension NetworkClient {
     /// 把 Encodable 结构体编码成 JSON 请求体
-    private func encodeBody(fromEncodable value: Encodable) throws -> Data {
+    func encodeJSONBody(fromEncodable value: Encodable) throws -> Data {
         do {
             return try encoder.encode(AnyEncodable(value))
         } catch {
@@ -325,102 +256,25 @@ extension NetworkClient {
     }
 
     /// 把松散字典编码成 JSON 请求体
-    private func encodeBody(fromDict dict: [String: Any]) throws -> Data {
+    func encodeJSONBody(fromDict dict: [String: Any]) throws -> Data {
         do {
             return try JSONSerialization.data(withJSONObject: dict)
         } catch {
             throw NetworkError.encoding(error)
         }
     }
-
-    /// 把 Encodable 结构体转成 URL 查询项
-    private func queryItems(fromEncodable value: Encodable) throws -> [URLQueryItem] {
-        let data: Data
-        do {
-            data = try encoder.encode(AnyEncodable(value))
-        } catch {
-            throw NetworkError.encoding(error)
-        }
-        guard let dict = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] else {
-            return []
-        }
-        return queryItems(fromDict: dict)
-    }
-
-    /// 把松散字典转成 URL 查询项
-    private func queryItems(fromDict dict: [String: Any]) -> [URLQueryItem] {
-        // 稳定排序，便于缓存与日志比对
-        dict.keys.sorted().map { key in
-            URLQueryItem(name: key, value: Self.queryStringValue(dict[key]))
-        }
-    }
-
-    /// 把任意 JSON 值转成查询字符串
-    private static func queryStringValue(_ value: Any?) -> String? {
-        switch value {
-        case let str as String: return str
-        case let num as NSNumber: return num.stringValue
-        case .none, is NSNull: return nil
-        default: return "\(value!)"
-        }
-    }
 }
 
-// MARK: - 错误与日志辅助方法
+//MARK: - 下载并发
 extension NetworkClient {
-    /// 把底层错误归一化为 NetworkError
-    private func mapTransportError(_ error: Error) -> NetworkError {
-        if let networkError = error as? NetworkError { return networkError }
-        if error is CancellationError { return .cancelled }
-        if let urlError = error as? URLError {
-            switch urlError.code {
-            case .timedOut: return .timeout
-            case .cancelled: return .cancelled
-            default: return .transport(urlError)
-            }
-        }
-        return .transport(error)
-    }
-
-    /// 调试日志（沿用项目 [debugLog] 风格，受全局开关控制）
-    private func log(_ message: String) {
-        #if DEBUG
-        guard NetworkConfiguration.shared.enableLog else { return }
-        print("[debugLog] NetworkClient \(message)")
-        #endif
-    }
-}
-
-// MARK: - DownloadLimiter
-/// 下载并发限制器：用 actor + 续体实现的简单信号量，限制同时进行的下载数量
-actor DownloadLimiter {
-    /// 最大并发数
-    private let maxConcurrent: Int
-    /// 当前占用数
-    private var current = 0
-    /// 等待队列
-    private var waiters: [CheckedContinuation<Void, Never>] = []
-
-    init(maxConcurrent: Int) {
-        self.maxConcurrent = maxConcurrent
-    }
-
-    /// 申请一个下载名额（满则挂起等待）
-    func acquire() async {
-        if current < maxConcurrent {
-            current += 1
-            return
-        }
-        await withCheckedContinuation { waiters.append($0) }
-    }
-
-    /// 释放一个下载名额（有等待者则直接放行）
-    func release() {
-        if waiters.isEmpty {
-            current = max(0, current - 1)
-        } else {
-            let next = waiters.removeFirst()
-            next.resume()
+    /// 取出某份配置对应的下载并发限制器（首次使用时按该配置的 `maxConcurrentDownloads` 创建）
+    func downloadSemaphore(for configuration: NetworkConfiguration) -> AsyncSemaphore {
+        downloadSemaphores.withValue { table in
+            let key = ObjectIdentifier(configuration)
+            if let existing = table[key] { return existing }
+            let semaphore = AsyncSemaphore(limit: configuration.maxConcurrentDownloads)
+            table[key] = semaphore
+            return semaphore
         }
     }
 }

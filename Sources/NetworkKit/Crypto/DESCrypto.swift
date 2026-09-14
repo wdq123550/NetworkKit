@@ -8,7 +8,7 @@
 import CommonCrypto
 import Foundation
 
-public enum CryptoAlgorithm {
+public enum CryptoAlgorithm: Sendable {
     /// 加密的枚举选项 AES/AES128/DES/DES3/CAST/RC2/RC4/Blowfish......
     case AES, AES128, DES, DES3, CAST, RC2, RC4, Blowfish
     var algorithm: CCAlgorithm {

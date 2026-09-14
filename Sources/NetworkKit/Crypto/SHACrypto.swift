@@ -23,7 +23,7 @@
 import CommonCrypto
 import Foundation
 
-public enum Algorithm {
+public enum Algorithm: Sendable {
     case md5, sha1, sha224, sha256, sha384, sha512
 
     fileprivate var hmacAlgorithm: CCHmacAlgorithm {
